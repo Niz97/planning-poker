@@ -1,34 +1,29 @@
 import type { RawData } from "ws";
 import WebSocket, { WebSocketServer } from "ws";
+import type { ClientMessage, ServerMessage, User } from "../types";
 
 const wss = new WebSocketServer({ port: 8080 });
 
 // Simple State
+interface UserSession {
+	id: string;
+	name: string;
+	ws: WebSocket;
+}
+
 interface AppState {
-	users: Map<string, { name: string; ws: WebSocket }>;
-	votes: Map<string, string>; // userId -> voteValue
+	users: Map<UserSession["id"], UserSession>;
+	votes: Map<UserSession["id"], string>;
 	isRevealed: boolean;
 }
 
-const state: AppState = {
+const emptyRoom: AppState = {
 	users: new Map(),
 	votes: new Map(),
 	isRevealed: false,
 };
 
-type MessageType =
-	| "user:join"
-	| "vote:cast"
-	| "vote:reveal"
-	| "vote:reset"
-	| "heartbeat";
-
-interface ClientMessage {
-	type: MessageType;
-	payload: any;
-	userId: string;
-	timestamp: number;
-}
+const state: AppState = emptyRoom;
 
 wss.on("connection", (ws) => {
 	console.log("Client connected");
@@ -36,27 +31,32 @@ wss.on("connection", (ws) => {
 
 	ws.on("message", (data: RawData) => {
 		try {
+			console.log("Server state:", state);
 			const message: ClientMessage = JSON.parse(data.toString());
 			currentUserId = message.userId;
 
 			switch (message.type) {
-				case "user:join":
+				case "client:user:join":
 					handleJoin(ws, message);
 					break;
-				case "vote:cast":
+				case "client:vote:cast":
 					handleVote(message);
 					break;
-				case "vote:reveal":
+				case "client:vote:reveal":
 					handleReveal();
 					break;
-				// case "vote:reset":
-				// 	handleReset();
-				// 	break;
-				case "heartbeat":
-					ws.send(
-						JSON.stringify({ type: "heartbeat:ack", timestamp: Date.now() }),
-					);
+				case "client:room:reset":
+					handleResetRoom();
 					break;
+				case "client:heartbeat": {
+					const ack: ServerMessage = {
+						type: "server:heartbeat:ack",
+						payload: { timestamp: Date.now() },
+						timestamp: Date.now(),
+					};
+					ws.send(JSON.stringify(ack));
+					break;
+				}
 			}
 		} catch (e) {
 			console.error("Failed to process message", e);
@@ -78,12 +78,12 @@ function handleJoin(ws: WebSocket, msg: ClientMessage) {
 		userId: string;
 		userName: string;
 	};
-	state.users.set(userId, { name: userName, ws });
+	state.users.set(userId, { id: userId, name: userName, ws });
 
 	// Ack to user
 	ws.send(
 		JSON.stringify({
-			type: "user:joined",
+			type: "server:user:joined",
 			payload: {
 				userId,
 				userName,
@@ -106,19 +106,24 @@ function handleVote(msg: ClientMessage) {
 
 function handleReveal() {
 	state.isRevealed = true;
-	const results = Array.from(state.votes.entries()).map(([uid, val]) => ({
-		userName: state.users.get(uid)?.name || "Unknown",
-		value: val,
-	}));
 
-	broadcast({
-		type: "vote:revealed",
-		payload: { results },
-	});
+	broadcastToAll();
+}
+
+function handleResetRoom() {
+	state.votes.clear();
+	state.isRevealed = false;
+
+	const resetMsg: ServerMessage = {
+		type: "server:room:reset",
+		payload: { timestamp: Date.now() },
+		timestamp: Date.now(),
+	};
+	broadcast(resetMsg);
 }
 
 // Helpers
-function broadcast(msg: unknown) {
+function broadcast(msg: ServerMessage) {
 	const data = JSON.stringify(msg);
 	for (const user of state.users.values()) {
 		if (user.ws.readyState === WebSocket.OPEN) {
@@ -128,21 +133,52 @@ function broadcast(msg: unknown) {
 }
 
 function broadcastStatus() {
-	const usersList = Array.from(state.users.entries()).map(([id, u]) => ({
-		userId: id,
-		userName: u.name,
-		voted: state.votes.has(id),
-		vote: state.isRevealed ? state.votes.get(id) : null,
-	}));
+	const usersList: User[] = Array.from(state.users.entries()).map(
+		([id, u]) => ({
+			id: id,
+			name: u.name,
+			voted: state.votes.has(id),
+			vote: state.isRevealed ? state.votes.get(id) || null : null,
+		}),
+	);
 
-	const status = {
-		type: "room:status",
+	const status: ServerMessage = {
+		type: "server:room:status",
 		payload: {
 			users: usersList,
 			isRevealed: state.isRevealed,
 		},
+		timestamp: Date.now(),
 	};
 	broadcast(status);
 }
 
+function broadcastToAll() {
+	console.log("Broadcasting to all");
+	const allUsers = Array.from(state.users.values());
+	const allWebsockets = allUsers.map((u) => u.ws);
+
+	const users = allUsers.map((user) => ({
+		id: user.id,
+		name: user.name,
+		vote: state.votes.get(user.id) || null,
+		voted: state.votes.has(user.id), // TODO: set to always true, realistically we should never be here unless every player has voted
+	}));
+
+	// send message to all open connections
+	for (const ws of allWebsockets) {
+		if (ws.readyState === WebSocket.OPEN) {
+			broadcast({
+				type: "server:vote:revealed",
+				payload: {
+					users,
+					isRevealed: true,
+				},
+				timestamp: Date.now(),
+			});
+		}
+	}
+}
+
 console.log("WebSocket server running on port 8080");
+console.log("State:", state);

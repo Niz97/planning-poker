@@ -7,26 +7,18 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { VoteCard } from "@/components/VoteCard";
 import { cn } from "@/lib/utils";
+import type {
+	ClientMessage,
+	ClientMessageType,
+	ServerMessage,
+	User,
+} from "../types";
 
 export const Route = createFileRoute("/")({ component: App });
 
-interface User {
-	userId: string;
-	userName: string;
-	voted: boolean;
-	vote: string | null;
-}
-
-interface RoomStatus {
+interface Room {
 	users: User[];
 	isRevealed: boolean;
-}
-
-interface AppMessage {
-	type: string;
-	payload: any;
-	userId?: string;
-	timestamp?: number;
 }
 
 const CARDS = [
@@ -49,15 +41,15 @@ function App() {
 	const [userName, setUserName] = useState<string>("");
 	const [userId] = useState(() => Math.random().toString(36).substring(7));
 	const [vote, setVote] = useState<string | null>(null);
-	const [roomStatus, setRoomStatus] = useState<RoomStatus>({
+	const [room, setRoomStatus] = useState<Room>({
 		users: [],
 		isRevealed: false,
 	});
 	const [isJoined, setIsJoined] = useState(false);
 
-	const sendMessage = (type: string, payload: any) => {
+	const sendMessage = (type: ClientMessageType, payload: any) => {
 		if (websocketRef.current?.readyState === WebSocket.OPEN) {
-			const message: AppMessage = {
+			const message: ClientMessage = {
 				type,
 				payload,
 				userId,
@@ -81,11 +73,11 @@ function App() {
 
 		ws.onmessage = (event) => {
 			try {
-				const message: AppMessage = JSON.parse(event.data);
+				const message = JSON.parse(event.data) as ServerMessage;
 				console.log("Received:", message);
 
 				switch (message.type) {
-					case "room:status":
+					case "server:room:status":
 						setRoomStatus(message.payload);
 						// If votes cleared, clear local vote
 						if (
@@ -94,6 +86,15 @@ function App() {
 						) {
 							setVote(null);
 						}
+						break;
+					case "server:vote:revealed":
+						setRoomStatus({
+							users: message.payload.users,
+							isRevealed: true,
+						});
+						break;
+					case "server:room:reset":
+						handleResetRoom();
 						break;
 				}
 			} catch (e) {
@@ -107,18 +108,31 @@ function App() {
 	const handleJoin = (e: React.FormEvent<HTMLFormElement>) => {
 		e.preventDefault();
 		if (!userName.trim()) return;
-		sendMessage("user:join", { userId, userName });
+		sendMessage("client:user:join", { userId, userName });
 		setIsJoined(true);
 	};
 
 	const handleVote = (val: string) => {
-		if (roomStatus.isRevealed) return;
+		if (room.isRevealed) return;
 		setVote(val);
-		sendMessage("vote:cast", { userId, value: val });
+		sendMessage("client:vote:cast", { userId, value: val });
 	};
 
-	const handleReveal = () => sendMessage("vote:reveal", {});
-	const handleReset = () => sendMessage("vote:reset", {});
+	const handleResetRoom = () => {
+		setRoomStatus((prev) => ({
+			...prev,
+			isRevealed: false,
+			users: prev.users.map((u) => ({
+				...u,
+				voted: false,
+				vote: null,
+			})),
+		}));
+		setVote(null);
+	};
+
+	const handleReveal = () => sendMessage("client:vote:reveal", {});
+	const handleReset = () => sendMessage("client:room:reset", {});
 
 	// Calculate user positions around the table
 	const getPositionStyle = (index: number, total: number) => {
@@ -183,8 +197,8 @@ function App() {
 						variant="outline"
 						className="text-neutral-400 border-neutral-800 px-3 py-1"
 					>
-						{roomStatus.users.length}{" "}
-						{roomStatus.users.length === 1 ? "User" : "Users"} Online
+						{room.users.length} {room.users.length === 1 ? "User" : "Users"}{" "}
+						Online
 					</Badge>
 					<div className="h-4 w-px bg-neutral-800" />
 					<div className="flex items-center gap-2">
@@ -200,20 +214,18 @@ function App() {
 				{/* Poker Table Area */}
 				<div className="w-full max-w-5xl">
 					<PokerTable>
-						{roomStatus.users.map((user, index) => (
+						{room.users.map((user, index) => (
 							<div
-								key={user.userId}
+								key={user.id}
 								className="absolute transition-all duration-700 ease-in-out"
-								style={getPositionStyle(index, roomStatus.users.length)}
+								style={getPositionStyle(index, room.users.length)}
 							>
 								<VoteCard
 									voted={user.voted}
-									isRevealed={roomStatus.isRevealed}
+									isRevealed={room.isRevealed}
 									value={user.vote}
 									userName={
-										user.userId === userId
-											? `${user.userName} (You)`
-											: user.userName
+										user.id === userId ? `${user.name} (You)` : user.name
 									}
 								/>
 							</div>
@@ -225,9 +237,7 @@ function App() {
 				<div className="flex gap-4 mt-8">
 					<Button
 						onClick={handleReveal}
-						disabled={
-							roomStatus.isRevealed || !roomStatus.users.some((u) => u.voted)
-						}
+						disabled={room.isRevealed || !room.users.some((u) => u.voted)}
 						className="bg-blue-600 hover:bg-blue-500 text-white font-bold h-12 px-8 min-w-32 shadow-lg shadow-blue-900/20"
 					>
 						Reveal Votes
@@ -258,7 +268,7 @@ function App() {
 							<button
 								key={val}
 								type="button"
-								disabled={roomStatus.isRevealed}
+								disabled={room.isRevealed}
 								className={cn(
 									"w-12 h-16 rounded-lg border-2 flex items-center justify-center text-xl font-bold transition-all duration-200 transform hover:scale-110 active:scale-95 disabled:opacity-50 disabled:hover:scale-100",
 									vote === val
