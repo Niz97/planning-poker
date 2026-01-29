@@ -2,28 +2,53 @@ import type { RawData } from "ws";
 import WebSocket, { WebSocketServer } from "ws";
 import type { ClientMessage, ServerMessage, User } from "../types";
 
-const wss = new WebSocketServer({ port: 8080 });
+const PORT = Number(process.env.PORT) || 8080;
+const wss = new WebSocketServer({ port: PORT });
 
-// Simple State
-interface UserSession {
+// -- State Definitions --
+
+interface Client {
 	id: string;
 	name: string;
 	ws: WebSocket;
+	roomId: string;
 }
 
-interface AppState {
-	users: Map<UserSession["id"], UserSession>;
-	votes: Map<UserSession["id"], string>;
+interface Room {
+	id: string;
+	users: Set<string>; // Set of userIds
+	votes: Map<string, string>; // userId -> vote value
 	isRevealed: boolean;
 }
 
-const emptyRoom: AppState = {
-	users: new Map(),
-	votes: new Map(),
-	isRevealed: false,
-};
+// Global State
+const clients = new Map<string, Client>(); // userId -> Client
+const rooms = new Map<string, Room>(); // roomId -> Room
 
-const state: AppState = emptyRoom;
+// -- Helpers --
+
+function getOrCreateRoom(roomId: string): Room {
+	let room = rooms.get(roomId);
+	if (!room) {
+		room = {
+			id: roomId,
+			users: new Set(),
+			votes: new Map(),
+			isRevealed: false,
+		};
+		rooms.set(roomId, room);
+		console.log(`Created room: ${roomId}`);
+	}
+	return room;
+}
+
+function getRoomForUser(userId: string): Room | undefined {
+	const client = clients.get(userId);
+	if (!client) return undefined;
+	return rooms.get(client.roomId);
+}
+
+// -- Handlers --
 
 wss.on("connection", (ws) => {
 	console.log("Client connected");
@@ -31,7 +56,6 @@ wss.on("connection", (ws) => {
 
 	ws.on("message", (data: RawData) => {
 		try {
-			console.log("Server state:", state);
 			const message: ClientMessage = JSON.parse(data.toString());
 			currentUserId = message.userId;
 
@@ -43,10 +67,10 @@ wss.on("connection", (ws) => {
 					handleVote(message);
 					break;
 				case "client:vote:reveal":
-					handleReveal();
+					handleReveal(message.userId);
 					break;
 				case "client:room:reset":
-					handleResetRoom();
+					handleResetRoom(message.userId);
 					break;
 				case "client:heartbeat": {
 					const ack: ServerMessage = {
@@ -64,121 +88,176 @@ wss.on("connection", (ws) => {
 	});
 
 	ws.on("close", () => {
-		if (currentUserId && state.users.has(currentUserId)) {
-			console.log(`User ${currentUserId} disconnected`);
-			state.users.delete(currentUserId);
-			state.votes.delete(currentUserId);
-			broadcastStatus();
+		if (currentUserId) {
+			handleDisconnect(currentUserId);
 		}
 	});
 });
 
 function handleJoin(ws: WebSocket, msg: ClientMessage) {
-	const { userId, userName } = msg.payload as {
+	const { userId, userName, roomId } = msg.payload as {
 		userId: string;
 		userName: string;
+		roomId?: string;
 	};
-	state.users.set(userId, { id: userId, name: userName, ws });
+
+	const targetRoomId = roomId || "default";
+
+	// Update Client state
+	clients.set(userId, {
+		id: userId,
+		name: userName,
+		ws,
+		roomId: targetRoomId,
+	});
+
+	// Update Room state
+	const room = getOrCreateRoom(targetRoomId);
+	room.users.add(userId);
+
+	console.log(`User ${userName} (${userId}) joined room ${targetRoomId}`);
 
 	// Ack to user
+	const userList = Array.from(room.users)
+		.map((uid) => clients.get(uid)?.name)
+		.filter((name): name is string => !!name);
+
 	ws.send(
 		JSON.stringify({
 			type: "server:user:joined",
 			payload: {
 				userId,
 				userName,
-				allUsers: Array.from(state.users.values()).map((u) => u.name),
+				roomId: targetRoomId,
+				allUsers: userList,
 			},
 		}),
 	);
 
-	// Broadcast updated status
-	broadcastStatus();
+	// Broadcast updated status to the room
+	broadcastStatus(targetRoomId);
 }
 
 function handleVote(msg: ClientMessage) {
 	const { userId, value } = msg.payload as { userId: string; value: string };
-	if (state.users.has(userId)) {
-		state.votes.set(userId, value);
-		broadcastStatus();
+	const room = getRoomForUser(userId);
+
+	if (room && room.users.has(userId)) {
+		room.votes.set(userId, value);
+		broadcastStatus(room.id);
 	}
 }
 
-function handleReveal() {
-	state.isRevealed = true;
+function handleReveal(userId: string) {
+	const room = getRoomForUser(userId);
 
-	broadcastToAll();
+	if (room) {
+		room.isRevealed = true;
+		broadcastReveal(room.id);
+	}
 }
 
-function handleResetRoom() {
-	state.votes.clear();
-	state.isRevealed = false;
+function handleResetRoom(userId: string) {
+	const room = getRoomForUser(userId);
 
-	const resetMsg: ServerMessage = {
-		type: "server:room:reset",
-		payload: { timestamp: Date.now() },
-		timestamp: Date.now(),
-	};
-	broadcast(resetMsg);
+	if (room) {
+		room.votes.clear();
+		room.isRevealed = false;
+
+		const resetMsg: ServerMessage = {
+			type: "server:room:reset",
+			payload: { timestamp: Date.now() },
+			timestamp: Date.now(),
+		};
+		broadcastToRoom(room.id, resetMsg);
+	}
 }
 
-// Helpers
-function broadcast(msg: ServerMessage) {
+function handleDisconnect(userId: string) {
+	const client = clients.get(userId);
+	if (client) {
+		console.log(`User ${userId} disconnected from room ${client.roomId}`);
+		const room = rooms.get(client.roomId);
+		if (room) {
+			room.users.delete(userId);
+			room.votes.delete(userId);
+
+			if (room.users.size === 0) {
+				console.log(`Room ${room.id} is empty, cleaning up? (Keeping for now)`);
+				// Optional: rooms.delete(room.id);
+			} else {
+				broadcastStatus(room.id);
+			}
+		}
+		clients.delete(userId);
+	}
+}
+
+// -- Broadcast Helpers --
+
+function broadcastToRoom(roomId: string, msg: ServerMessage) {
+	const room = rooms.get(roomId);
+	if (!room) return;
+
 	const data = JSON.stringify(msg);
-	for (const user of state.users.values()) {
-		if (user.ws.readyState === WebSocket.OPEN) {
-			user.ws.send(data);
+	for (const userId of room.users) {
+		const client = clients.get(userId);
+		if (client && client.ws.readyState === WebSocket.OPEN) {
+			client.ws.send(data);
 		}
 	}
 }
 
-function broadcastStatus() {
-	const usersList: User[] = Array.from(state.users.entries()).map(
-		([id, u]) => ({
-			id: id,
-			name: u.name,
-			voted: state.votes.has(id),
-			vote: state.isRevealed ? state.votes.get(id) || null : null,
-		}),
-	);
+function broadcastStatus(roomId: string) {
+	const room = rooms.get(roomId);
+	if (!room) return;
+
+	// Construct User objects for the frontend
+	const usersList: User[] = Array.from(room.users).map((userId) => {
+		const client = clients.get(userId);
+		return {
+			id: userId,
+			name: client ? client.name : "Unknown",
+			voted: room.votes.has(userId),
+			vote: room.isRevealed ? room.votes.get(userId) || null : null,
+		};
+	});
 
 	const status: ServerMessage = {
 		type: "server:room:status",
 		payload: {
 			users: usersList,
-			isRevealed: state.isRevealed,
+			isRevealed: room.isRevealed,
 		},
 		timestamp: Date.now(),
 	};
-	broadcast(status);
+	broadcastToRoom(roomId, status);
 }
 
-function broadcastToAll() {
-	console.log("Broadcasting to all");
-	const allUsers = Array.from(state.users.values());
-	const allWebsockets = allUsers.map((u) => u.ws);
+function broadcastReveal(roomId: string) {
+	const room = rooms.get(roomId);
+	if (!room) return;
 
-	const users = allUsers.map((user) => ({
-		id: user.id,
-		name: user.name,
-		vote: state.votes.get(user.id) || null,
-		voted: state.votes.has(user.id), // TODO: set to always true, realistically we should never be here unless every player has voted
-	}));
+	console.log(`Broadcasting reveal to room ${roomId}`);
 
-	// send message to all open connections
-	for (const ws of allWebsockets) {
-		if (ws.readyState === WebSocket.OPEN) {
-			broadcast({
-				type: "server:vote:revealed",
-				payload: {
-					users,
-					isRevealed: true,
-				},
-				timestamp: Date.now(),
-			});
-		}
-	}
+	const usersList: User[] = Array.from(room.users).map((userId) => {
+		const client = clients.get(userId);
+		return {
+			id: userId,
+			name: client ? client.name : "Unknown",
+			vote: room.votes.get(userId) || null,
+			voted: room.votes.has(userId),
+		};
+	});
+
+	broadcastToRoom(roomId, {
+		type: "server:vote:revealed",
+		payload: {
+			users: usersList,
+			isRevealed: true,
+		},
+		timestamp: Date.now(),
+	});
 }
 
-console.log("WebSocket server running on port 8080");
-console.log("State:", state);
+console.log(`WebSocket server running on port ${PORT}`);

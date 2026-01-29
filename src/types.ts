@@ -28,7 +28,12 @@ export type ServerMessage =
 	  }
 	| {
 			type: "server:user:joined";
-			payload: { userId: string; userName: string; allUsers: string[] };
+			payload: {
+				userId: string;
+				userName: string;
+				allUsers: string[];
+				roomId?: string;
+			};
 			timestamp: number;
 	  }
 	| {
