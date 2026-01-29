@@ -16,23 +16,28 @@ const state: AppState = {
 	isRevealed: false,
 };
 
-// These should probs be used on the FE as well?
-type MessageType = "user:join" | "vote:cast" | "vote:reveal" | "heartbeat";
+type MessageType =
+	| "user:join"
+	| "vote:cast"
+	| "vote:reveal"
+	| "vote:reset"
+	| "heartbeat";
 
 interface ClientMessage {
 	type: MessageType;
-	payload: unknown;
+	payload: any;
 	userId: string;
 	timestamp: number;
 }
 
 wss.on("connection", (ws) => {
 	console.log("Client connected");
+	let currentUserId: string | null = null;
 
 	ws.on("message", (data: RawData) => {
 		try {
 			const message: ClientMessage = JSON.parse(data.toString());
-			console.log(`Received: ${message.type} from ${message.userId}`);
+			currentUserId = message.userId;
 
 			switch (message.type) {
 				case "user:join":
@@ -44,6 +49,9 @@ wss.on("connection", (ws) => {
 				case "vote:reveal":
 					handleReveal();
 					break;
+				// case "vote:reset":
+				// 	handleReset();
+				// 	break;
 				case "heartbeat":
 					ws.send(
 						JSON.stringify({ type: "heartbeat:ack", timestamp: Date.now() }),
@@ -56,7 +64,12 @@ wss.on("connection", (ws) => {
 	});
 
 	ws.on("close", () => {
-		// TODO: Find and remove user
+		if (currentUserId && state.users.has(currentUserId)) {
+			console.log(`User ${currentUserId} disconnected`);
+			state.users.delete(currentUserId);
+			state.votes.delete(currentUserId);
+			broadcastStatus();
+		}
 	});
 });
 
@@ -115,14 +128,17 @@ function broadcast(msg: unknown) {
 }
 
 function broadcastStatus() {
+	const usersList = Array.from(state.users.entries()).map(([id, u]) => ({
+		userId: id,
+		userName: u.name,
+		voted: state.votes.has(id),
+		vote: state.isRevealed ? state.votes.get(id) : null,
+	}));
+
 	const status = {
-		type: "vote:status",
+		type: "room:status",
 		payload: {
-			users: Array.from(state.users.entries()).map(([id, u]) => ({
-				userId: id,
-				userName: u.name,
-				voted: state.votes.has(id),
-			})),
+			users: usersList,
 			isRevealed: state.isRevealed,
 		},
 	};
