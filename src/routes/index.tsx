@@ -31,7 +31,15 @@ function App() {
 				console.log(`MESSAGE`, e.data);
 				setReceivedMessage(e.data);
 			});
+
+			websocketRef.current.addEventListener("close", () => {
+				console.log("DISCONNECTED");
+			});
 		}
+
+		return () => {
+			websocketRef.current?.close();
+		};
 	}, []);
 
 	return (
